@@ -1,6 +1,5 @@
 import std/[
-  rdstdin,
-  terminal,
+  logging,
 ]
 
 import rfbclient
@@ -11,34 +10,15 @@ const REMOTE_HOST = "10.10.1.2"
 const REMOTE_PORT = 5900
 
 proc main() {.async} =
-  let client = newRFBClient(REMOTE_HOST, REMOTE_PORT)
-  await client.connect
+  let client = newRFBClient()
+  let serverParams = await client.handShake(REMOTE_HOST, REMOTE_PORT)
 
-  let (major, minor) = await client.recvVersion
-  echo (major, minor)
-  await client.sendVersion(major, minor)
-
-  let secTypes = await client.recvSecurityTypes
-  echo secTypes
-  await client.sendSecurityType(DIFFIE_HELLMAN)
-
-  let params = await client.recvDiffieHellmanParams
-  echo params
-
-  let username = readLineFromStdin("Username: ")
-  let password = readPasswordFromStdin("Password: ")
-  await client.sendUserCredentials(params, username, password)
-
-  block:
-    let (ok, errMsg) = await client.recvSecurityResult
-    if ok != 0:
-      echo errMsg
-      return
-
-  await client.sendClientInit()
-  echo await client.recvServerInit()
+  echo serverParams
 
 
 
 when isMainModule:
+  when not defined(release):
+    addHandler(newConsoleLogger(levelThreshold = lvlDebug))
+
   waitFor main()
