@@ -1,11 +1,13 @@
 import std/[
+  algorithm,
   options,
 ]
 
-import bigints
+import pkg/bigints
 
 
 
+# https://en.wikipedia.org/wiki/Diffie%E2%80%93Hellman_key_exchange#Cryptographic_explanation
 type
   DiffieHellmanParams* = object
     generator*: uint16
@@ -37,8 +39,9 @@ proc toUint8Seq*(x: BigInt): seq[uint8] =
   let z = initBigInt(0)
   while x != z:
     let a = toInt[uint8](x mod b).get
-    result = a & result
+    result.add a
     x = x shr 8
+  result.reverse
 
 proc toUint8Seq*(x: BigInt, n: int): seq[uint8] =
   result = newSeq[uint8](n)

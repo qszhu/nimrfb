@@ -7,6 +7,7 @@ import std/[
 ]
 
 import binsock
+import encoding/[rawencoding, zlibencoding, zrleencoding]
 import security/[crypto, dh]
 import types
 
@@ -17,12 +18,13 @@ export asyncdispatch, types
 type
   RFBClient* = ref object
     sock: AsyncSocket
+    serverParams*: ServerParams
 
 proc newRFBClient*(): RFBClient =
   result.new
 
 
-
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#protocolversion
 proc recvVersion(self: RFBClient): Future[(int, int)] {.async.} =
   let s = await self.sock.readString(12)
   doAssert s[0 ..< 3] == "RFB"
@@ -36,15 +38,21 @@ proc sendVersion(self: RFBClient, major, minor: int) {.async.} =
 
 
 
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#security
 proc recvSecurityTypes(self: RFBClient): Future[seq[uint8]] {.async.} =
   let n = await self.sock.readUint8
-  return await self.sock.readUint8Seq(n)
+  if n != 0:
+    return await self.sock.readUint8Seq(n)
+
+  let rLen = await self.sock.readUint32
+  return cast[seq[uint8]](await self.sock.readString(rLen))
 
 proc sendSecurityType(self: RFBClient, secType: SecurityType) {.async.} =
   await self.sock.writeUint8(secType.uint8)
 
 
 
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#diffie-hellman-authentication
 proc recvDiffieHellmanParams(self: RFBClient): Future[DiffieHellmanParams] {.async.} =
   var params: DiffieHellmanParams
 
@@ -58,21 +66,22 @@ proc recvDiffieHellmanParams(self: RFBClient): Future[DiffieHellmanParams] {.asy
 proc sendUserCredentials(self: RFBClient, dh: DiffieHellmanParams, username, password: string) {.async.} =
   doAssert dh.keySize == 128
   let privKey = dh.privateKey
-  let secret = dh.sharedSecret(privKey)
-  let encKey = md5sum(secret.toUint8Seq)
+  var secret = dh.sharedSecret(privKey).toUint8Seq
+  var encKey = secret.md5sum
 
   proc packUserCredentials(username, password: string): string =
     result = newString(128)
-    copyMem(addr result[0], addr username[0], username.len)
-    copyMem(addr result[64], addr password[0], password.len)
+    copyMem(result[0].addr, username[0].addr, username.len)
+    copyMem(result[64].addr, password[0].addr, password.len)
 
   let data = aes128ECBEncrypt(packUserCredentials(username, password), encKey.writeUint8Seq)
 
-  let pubKey = dh.publicKey(privKey)
+  var pubKey = dh.publicKey(privKey).toUint8Seq(dh.keySize.int)
 
   await self.sock.writeString(data)
-  await self.sock.writeUint8Seq(pubKey.toUint8Seq(dh.keySize.int))
+  await self.sock.writeUint8Seq(pubKey)
 
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#securityresult
 proc recvSecurityResult(self: RFBClient): Future[(uint32, string)] {.async.} =
   let sr = await self.sock.readUint32
   case sr:
@@ -92,8 +101,23 @@ proc recvSecurityResult(self: RFBClient): Future[(uint32, string)] {.async.} =
 
 
 
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#clientinit
 proc sendClientInit(self: RFBClient, sharedFlag = true) {.async.} =
   await self.sock.writeBool sharedFlag
+
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#serverinit
+proc recvPixelFormat(self: RFBClient): Future[PixelFormat] {.async.}
+proc recvServerInit(self: RFBClient): Future[ServerParams] {.async.} =
+  var serverParams: ServerParams
+
+  serverParams.fbWidth = await self.sock.readUint16
+  serverParams.fbHeight = await self.sock.readUint16
+  serverParams.pixelFormat = await self.recvPixelFormat
+
+  let n = await self.sock.readUint32
+  serverParams.name = await self.sock.readString(n)
+
+  return serverParams
 
 proc recvPixelFormat(self: RFBClient): Future[PixelFormat] {.async.} =
   var pixelFormat: PixelFormat
@@ -110,19 +134,7 @@ proc recvPixelFormat(self: RFBClient): Future[PixelFormat] {.async.} =
   pixelFormat.blueShift = await self.sock.readUint8
 
   await self.sock.skip(3)
-  return pixelFormat
-
-proc recvServerInit(self: RFBClient): Future[ServerParam] {.async.} =
-  var serverParam: ServerParam
-
-  serverParam.fbWidth = await self.sock.readUint16
-  serverParam.fbHeight = await self.sock.readUint16
-  serverParam.pixelFormat = await self.recvPixelFormat
-
-  let n = await self.sock.readUint32
-  serverParam.name = await self.sock.readString(n)
-
-  return serverParam
+  pixelFormat
 
 
 
@@ -130,7 +142,7 @@ proc handShake*(self: RFBClient,
   remoteHost: string,
   remotePort: int,
   sharedFlag = true
-): Future[ServerParam] {.async.} =
+) {.async.} =
   self.sock = newAsyncSocket()
   await self.sock.connect(remoteHost, Port(remotePort))
 
@@ -138,7 +150,7 @@ proc handShake*(self: RFBClient,
   logging.debug &"Version: {major}.{minor}"
   doAssert major == 3
   doAssert minor >= 8
-  await self.sendVersion(major, minor)
+  await self.sendVersion(3, 8)
 
   let secTypes = await self.recvSecurityTypes
   logging.debug &"Security types: {secTypes}"
@@ -158,4 +170,58 @@ proc handShake*(self: RFBClient,
       raise newException(ValueError, &"Security error: {errMsg}")
 
   await self.sendClientInit(sharedFlag)
-  return await self.recvServerInit
+  self.serverParams = await self.recvServerInit
+
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#setencodings
+proc sendSetEncodings*(self: RFBClient,
+  encodings: seq[int32],
+) {.async.} =
+  await self.sock.writeUint8(2)
+  await self.sock.writeUint8(0)
+  await self.sock.writeUint16(encodings.len.uint16)
+  for e in encodings:
+    await self.sock.writeInt32(e)
+
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#framebufferupdaterequest
+proc sendFramebufferUpdateRequest*(self: RFBClient,
+  x, y, width, height: uint16,
+  incremental = true
+) {.async.} =
+  await self.sock.writeUint8(3)
+  await self.sock.writeBool(incremental)
+  await self.sock.writeUint16(x)
+  await self.sock.writeUint16(y)
+  await self.sock.writeUint16(width)
+  await self.sock.writeUint16(height)
+
+# https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst#framebufferupdate
+proc recvFramebufferUpdate*(self: RFBClient): Future[seq[(uint16, uint16, uint16, uint16, seq[uint8])]] {.async.}=
+  let t = await self.sock.readUint8
+  doAssert t == 0
+  await self.sock.skip(1)
+
+  let pf = self.serverParams.pixelFormat
+  let n = await self.sock.readUint16
+  for i in 0 ..< n.int:
+    let x = await self.sock.readUint16
+    let y = await self.sock.readUint16
+    let width = await self.sock.readUint16
+    let height = await self.sock.readUint16
+    let et = await self.sock.readInt32
+    echo (x, y, width, height, et)
+
+    case et:
+    of RAW.int32:
+      result.add (x, y, width, height,
+        await recvRawEncodingFB(self.sock, width.int, height.int, pf.bitsPerPixel.int)
+      )
+    of ZLIB.int32:
+      result.add (x, y, width, height,
+        await recvZlibEncodingFB(self.sock, width.int, height.int, pf.bitsPerPixel.int)
+      )
+    of ZRLE.int32:
+      result.add (x, y, width, height,
+        await recvZRleEncodingFB(self.sock, width.int, height.int, pf.bitsPerPixel.int)
+      )
+    else:
+      raise newException(ValueError, &"Unknown encoding: {et}")

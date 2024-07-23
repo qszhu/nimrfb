@@ -1,6 +1,6 @@
 type
   SecurityType* = enum
-    DIFFIE_HELLMAN = 30'u8
+    DIFFIE_HELLMAN = 30
 
 type
   PixelFormat* = object
@@ -16,8 +16,14 @@ type
     blueShift*: uint8
 
 type
-  ServerParam* = object
+  ServerParams* = object
     fbWidth*: uint16
     fbHeight*: uint16
     pixelFormat*: PixelFormat
     name*: string
+
+type
+  Encoding* = enum
+    RAW = 0
+    ZLIB = 6
+    ZRLE = 16
